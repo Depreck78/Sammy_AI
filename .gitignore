@@ -1,0 +1,69 @@
+# macOS and editor noise
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.secret
+*secret*
+*token*
+*credential*
+
+# Sammy local runtime data
+.sammy/
+sammy.sqlite
+sammy.sqlite-*
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+uploads/
+*.log
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+frontend/tsconfig.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generated archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz

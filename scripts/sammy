@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  SOURCE_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  if [[ "$SOURCE" != /* ]]; then
+    SOURCE="$SOURCE_DIR/$SOURCE"
+  fi
+done
+APP_DIR="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+COMMAND="${1:-start}"
+PORT="${SAMMY_PORT:-3131}"
+SAMMY_HOME="${SAMMY_HOME:-$HOME/.sammy}"
+LAN_FLAG="$SAMMY_HOME/lan-enabled"
+
+# Decide the bind host. An explicit SAMMY_HOST wins; `lan`/`local` set the mode and persist it
+# via LAN_FLAG; every other command (start/restart/reboot) honors that saved preference, so LAN
+# mode survives restarts instead of silently reverting to localhost.
+if [ -n "${SAMMY_HOST:-}" ]; then
+  HOST="$SAMMY_HOST"
+elif [ "$COMMAND" = "lan" ]; then
+  HOST="0.0.0.0"
+elif [ "$COMMAND" = "local" ]; then
+  HOST="127.0.0.1"
+elif [ -f "$LAN_FLAG" ]; then
+  HOST="0.0.0.0"
+else
+  HOST="127.0.0.1"
+fi
+CHECK_HOST="$HOST"
+case "$CHECK_HOST" in
+  0.0.0.0|::)
+    CHECK_HOST="127.0.0.1"
+    ;;
+esac
+case "$HOST" in
+  127.0.0.1|localhost|0.0.0.0|::)
+    URL="http://localhost:${PORT}"
+    ;;
+  *)
+    URL="http://${HOST}:${PORT}"
+    ;;
+esac
+LOG_FILE="$SAMMY_HOME/sammy.log"
+ERR_FILE="$SAMMY_HOME/sammy.err.log"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_FILE="$PLIST_DIR/com.sammy.local.plist"
+LAUNCH_LABEL="com.sammy.local"
+
+mkdir -p "$SAMMY_HOME"
+
+usage() {
+  cat <<EOF
+Usage: sammy [start|lan|local|serve|unserve|restart|stop|status|logs|uninstall]
+
+Commands:
+  start      Start Sammy and open the browser (default); keeps LAN mode if it's on
+  lan        Turn ON phone/LAN access and keep it on across restarts (asks once)
+  local      Turn OFF network access — localhost only — and keep it off
+  serve      Serve Sammy over HTTPS on your tailnet (needs Tailscale HTTPS enabled)
+  unserve    Stop serving Sammy over HTTPS
+  restart    Stop then start Sammy (preserves the current LAN/local mode)
+  stop       Stop Sammy
+  status     Print whether Sammy is listening on $URL
+  logs       Follow Sammy logs
+  uninstall  Stop Sammy, remove the launch agent + 'sammy' commands, and optionally delete
+             local data. Add --purge to also delete data, or --keep-data to keep it.
+EOF
+}
+
+host_exposes_network() {
+  case "$HOST" in
+    127.0.0.1|localhost|::1)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+confirm_network_exposure() {
+  if ! host_exposes_network; then
+    return 0
+  fi
+
+  cat >&2 <<EOF
+WARNING: Sammy will listen on ${HOST}:${PORT}.
+
+Set a login password in Settings > General before using LAN mode if other people
+or devices may be on this network. Without a password, anyone who can reach this
+address may access the app, upload files, and prompt enabled tools to act with
+your configured local credentials. Email, filesystem, and external plugins can
+perform real actions when enabled for an agent.
+
+Only continue on a trusted private network.
+EOF
+
+  if [ "${SAMMY_ALLOW_NETWORK:-}" = "1" ] || [ "${SAMMY_ALLOW_LAN:-}" = "1" ]; then
+    echo "Network exposure allowed by environment variable." >&2
+    return 0
+  fi
+
+  if [ ! -t 0 ]; then
+    echo "Refusing to start network-exposed Sammy without confirmation." >&2
+    echo "Set SAMMY_ALLOW_NETWORK=1 only if you understand the risk." >&2
+    exit 1
+  fi
+
+  printf 'Type "yes" to continue: ' >&2
+  read -r answer
+  if [ "$answer" != "yes" ]; then
+    echo "Canceled."
+    exit 1
+  fi
+}
+
+python_bin() {
+  if [ -x "$APP_DIR/.venv/bin/python" ]; then
+    printf '%s\n' "$APP_DIR/.venv/bin/python"
+  else
+    command -v python3
+  fi
+}
+
+tailscale_bin() {
+  local candidate
+  for candidate in tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale /usr/local/bin/tailscale /opt/homebrew/bin/tailscale; do
+    if command -v "$candidate" >/dev/null 2>&1; then printf '%s' "$candidate"; return 0; fi
+    [ -x "$candidate" ] && { printf '%s' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+tailscale_dns() {
+  local ts; ts="$(tailscale_bin)" || return 1
+  "$ts" status --json 2>/dev/null \
+    | "$(python_bin)" -c 'import sys,json; print((json.load(sys.stdin).get("Self") or {}).get("DNSName","").rstrip("."))' 2>/dev/null
+}
+
+is_running() {
+  "$(python_bin)" - "$CHECK_HOST" "$PORT" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket()
+sock.settimeout(0.35)
+try:
+    sock.connect((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+PY
+}
+
+lan_ip() {
+  "$(python_bin)" - <<'PY'
+import socket
+
+addresses = []
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.connect(("8.8.8.8", 80))
+    addresses.append(sock.getsockname()[0])
+    sock.close()
+except OSError:
+    pass
+
+try:
+    for result in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+        addresses.append(result[4][0])
+except OSError:
+    pass
+
+seen = set()
+for address in addresses:
+    if address in seen:
+        continue
+    seen.add(address)
+    if address.startswith("127.") or address.startswith("169.254."):
+        continue
+    print(address)
+    break
+PY
+}
+
+listener_allows_lan() {
+  local endpoints endpoint
+  endpoints="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 {print $9}' || true)"
+  for endpoint in $endpoints; do
+    if [ "$endpoint" = "*:${PORT}" ] || [ "$endpoint" = "0.0.0.0:${PORT}" ] || [ "$endpoint" = "[::]:${PORT}" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+local_hostname() {
+  # macOS Bonjour/mDNS name. It resolves on the LAN to whatever IP the Mac
+  # currently holds, so http://<name>.local:PORT stays fixed across Wi-Fi/IP changes.
+  local name
+  name="$(scutil --get LocalHostName 2>/dev/null || true)"
+  [ -n "$name" ] && printf '%s' "$name" | tr '[:upper:]' '[:lower:]'
+}
+
+print_lan_url() {
+  local ip host
+  host="$(local_hostname || true)"
+  if [ -n "$host" ]; then
+    echo "Phone URL (fixed):  http://${host}.local:${PORT}"
+  fi
+  ip="$(lan_ip || true)"
+  if [ -n "$ip" ]; then
+    echo "Phone URL (by IP):  http://${ip}:${PORT}"
+  elif [ -z "$host" ]; then
+    echo "Phone URL: use your Mac's local IP address on port ${PORT}"
+  fi
+  echo "Keep this Mac awake and use the same Wi-Fi network."
+}
+
+print_access_urls() {
+  echo "Sammy is running locally at $URL"
+  case "$HOST" in
+    0.0.0.0|::)
+      print_lan_url
+      ;;
+    127.0.0.1|localhost)
+      if listener_allows_lan; then
+        print_lan_url
+      fi
+      ;;
+    *)
+      echo "Phone URL: http://${HOST}:${PORT}"
+      ;;
+  esac
+}
+
+focus_or_open() {
+  if command -v osascript >/dev/null 2>&1; then
+    osascript >/dev/null 2>&1 <<EOF || open "$URL"
+set targetUrl to "$URL"
+set chromeRunning to false
+set safariRunning to false
+tell application "System Events"
+  if exists process "Google Chrome" then set chromeRunning to true
+  if exists process "Safari" then set safariRunning to true
+end tell
+
+if chromeRunning then
+  tell application "Google Chrome"
+    repeat with w in windows
+      set tabIndex to 1
+      repeat with t in tabs of w
+        if URL of t starts with targetUrl then
+          set active tab index of w to tabIndex
+          set index of w to 1
+          activate
+          return
+        end if
+        set tabIndex to tabIndex + 1
+      end repeat
+    end repeat
+  end tell
+end if
+
+if safariRunning then
+  tell application "Safari"
+    repeat with w in windows
+      set tabIndex to 1
+      repeat with t in tabs of w
+        if URL of t starts with targetUrl then
+          set current tab of w to t
+          set index of w to 1
+          activate
+          return
+        end if
+        set tabIndex to tabIndex + 1
+      end repeat
+    end repeat
+  end tell
+end if
+
+open location targetUrl
+EOF
+  else
+    open "$URL"
+  fi
+}
+
+start_server() {
+  local py
+  py="$(python_bin)"
+  "$py" - "$py" "$APP_DIR/backend" "$HOST" "$PORT" "$LOG_FILE" "$ERR_FILE" <<'PY'
+import os
+import signal
+import sys
+
+python, backend, host, port, log_file, err_file = sys.argv[1:]
+
+if os.fork() > 0:
+    sys.exit(0)
+
+os.setsid()
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+if os.fork() > 0:
+    os._exit(0)
+
+os.chdir(backend)
+os.umask(0)
+
+stdin = os.open(os.devnull, os.O_RDONLY)
+stdout = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+stderr = os.open(err_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+os.dup2(stdin, 0)
+os.dup2(stdout, 1)
+os.dup2(stderr, 2)
+for fd in (stdin, stdout, stderr):
+    if fd > 2:
+        os.close(fd)
+
+env = os.environ.copy()
+env["PYTHONPATH"] = backend
+env["SAMMY_HOST"] = host
+env["SAMMY_PORT"] = port
+os.execve(
+    python,
+    [python, "-m", "uvicorn", "app.main:app", "--host", host, "--port", port],
+    env,
+)
+PY
+}
+
+app_dir_needs_user_shell() {
+  case "$APP_DIR" in
+    "$HOME/Desktop"|"$HOME/Desktop"/*|"$HOME/Documents"|"$HOME/Documents"/*|"$HOME/Downloads"|"$HOME/Downloads"/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+write_launch_agent() {
+  local py
+  py="$(python_bin)"
+  mkdir -p "$PLIST_DIR"
+  cat >"$PLIST_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LAUNCH_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$py</string>
+    <string>-m</string>
+    <string>uvicorn</string>
+    <string>app.main:app</string>
+    <string>--host</string>
+    <string>$HOST</string>
+    <string>--port</string>
+    <string>$PORT</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$APP_DIR/backend</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>$APP_DIR/backend</string>
+    <key>SAMMY_HOST</key>
+    <string>$HOST</string>
+    <key>SAMMY_PORT</key>
+    <string>$PORT</string>
+    <key>SAMMY_HOME</key>
+    <string>$SAMMY_HOME</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$LOG_FILE</string>
+  <key>StandardErrorPath</key>
+  <string>$ERR_FILE</string>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+</dict>
+</plist>
+EOF
+}
+
+start_with_launch_agent() {
+  command -v launchctl >/dev/null 2>&1 || return 1
+  if app_dir_needs_user_shell; then
+    if [ "${SAMMY_NO_BROWSER:-}" != "1" ]; then
+      launchctl bootout "gui/$UID/$LAUNCH_LABEL" >/dev/null 2>&1 || true
+    fi
+    # Keep the launcher metadata current even when macOS requires the server
+    # itself to inherit Desktop access from the user's shell.
+    write_launch_agent
+    return 1
+  fi
+  write_launch_agent
+
+  if launchctl print "gui/$UID/$LAUNCH_LABEL" >/dev/null 2>&1; then
+    launchctl bootout "gui/$UID/$LAUNCH_LABEL" >/dev/null 2>&1 || true
+  fi
+  launchctl bootstrap "gui/$UID" "$PLIST_FILE" >/dev/null 2>&1 || true
+
+  launchctl kickstart -k "gui/$UID/$LAUNCH_LABEL" >/dev/null 2>&1 || return 1
+
+  for _ in $(seq 1 40); do
+    if is_running; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  launchctl bootout "gui/$UID/$LAUNCH_LABEL" >/dev/null 2>&1 || true
+  return 1
+}
+
+stop_launch_agent() {
+  command -v launchctl >/dev/null 2>&1 || return 0
+  launchctl bootout "gui/$UID/$LAUNCH_LABEL" >/dev/null 2>&1 || true
+}
+
+stop_server() {
+  stop_launch_agent
+  local pids
+  pids="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -n "$pids" ]; then
+    for pid in $pids; do
+      if ps -p "$pid" -o command= | grep -q "uvicorn app.main:app"; then
+        kill "$pid" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+  for _ in $(seq 1 40); do
+    local remaining=""
+    pids="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    for pid in $pids; do
+      if ps -p "$pid" -o command= | grep -q "uvicorn app.main:app"; then
+        remaining="$remaining $pid"
+      fi
+    done
+    if [ -z "$remaining" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+}
+
+print_status() {
+  if is_running; then
+    print_access_urls
+  else
+    echo "Sammy is not running at $URL"
+    return 1
+  fi
+}
+
+case "$COMMAND" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  logs)
+    touch "$LOG_FILE" "$ERR_FILE"
+    tail -n 80 -f "$LOG_FILE" "$ERR_FILE"
+    exit 0
+    ;;
+  stop)
+    stop_server
+    echo "Sammy stopped"
+    exit 0
+    ;;
+  restart)
+    # The saved LAN flag counts as prior consent, so a normal restart doesn't re-prompt.
+    [ -f "$LAN_FLAG" ] || confirm_network_exposure
+    stop_server
+    ;;
+  lan)
+    confirm_network_exposure
+    touch "$LAN_FLAG"   # persist: stay in LAN mode across restarts/reboots
+    echo "Phone access is ON — Sammy will stay reachable on your network across restarts."
+    stop_server
+    ;;
+  local)
+    rm -f "$LAN_FLAG"   # persist: stay localhost-only
+    echo "Phone access is OFF — Sammy is localhost-only now."
+    stop_server
+    ;;
+  serve)
+    ts="$(tailscale_bin)" || { echo "Tailscale isn't installed."; exit 1; }
+    dns="$(tailscale_dns || true)"
+    if [ -z "$dns" ]; then
+      echo "Tailscale isn't logged in. Open the Tailscale app and sign in, then retry."
+      exit 1
+    fi
+    # Label this device "sammy" in the tailnet so the link is sammy.<tailnet>.ts.net
+    # (Tailscale-internal name only — doesn't change the Mac's real hostname).
+    case "$dns" in
+      sammy.*) ;;
+      *) "$ts" set --hostname=sammy >/dev/null 2>&1 && sleep 1 && dns="$(tailscale_dns || echo "$dns")" ;;
+    esac
+    # Fast capability check — fails immediately if HTTPS certs aren't enabled in the admin,
+    # so we never hang on `tailscale serve` trying to fetch a cert it can't get.
+    tmp="$(mktemp -d)"
+    if ! ( cd "$tmp" && "$ts" cert "$dns" >/dev/null 2>&1 ); then
+      rm -rf "$tmp"
+      echo "Tailscale HTTPS isn't enabled for your account yet."
+      echo "Enable 'HTTPS Certificates' at https://login.tailscale.com/admin/dns , then run: sammy serve"
+      exit 1
+    fi
+    rm -rf "$tmp"
+    "$ts" serve --bg "$PORT" >/dev/null 2>&1 || { echo "Could not start tailscale serve."; exit 1; }
+    echo "Sammy is now served over HTTPS at: https://$dns"
+    echo "Open that on any device signed into your tailnet."
+    exit 0
+    ;;
+  unserve)
+    ts="$(tailscale_bin)" || { echo "Tailscale isn't installed."; exit 1; }
+    "$ts" serve reset >/dev/null 2>&1 || true
+    echo "Stopped serving Sammy over HTTPS."
+    exit 0
+    ;;
+  uninstall|delete)
+    echo "Uninstalling Sammy..."
+    stop_server
+    stop_launch_agent
+    rm -f "$PLIST_FILE"
+    # Remove the CLI symlinks created by setup.sh.
+    for link in /usr/local/bin/sammy /usr/local/bin/Sammy "$HOME/.local/bin/sammy" "$HOME/.local/bin/Sammy"; do
+      [ -L "$link" ] || continue
+      rm -f "$link" 2>/dev/null || sudo rm -f "$link" 2>/dev/null || true
+    done
+    # Stop any HTTPS serve config (best-effort).
+    ts="$(tailscale_bin 2>/dev/null || true)"
+    [ -n "$ts" ] && "$ts" serve reset >/dev/null 2>&1 || true
+    # Local data (chats, settings, encrypted credentials) — destructive, so opt in.
+    case "${2:-}" in
+      --purge)
+        rm -rf "$SAMMY_HOME"
+        echo "Deleted local data ($SAMMY_HOME)."
+        ;;
+      --keep-data)
+        echo "Kept local data ($SAMMY_HOME)."
+        ;;
+      *)
+        if [ -t 0 ]; then
+          printf 'Also delete your Sammy data (chats, settings, credentials) in %s? [y/N]: ' "$SAMMY_HOME"
+          read -r answer
+          case "$answer" in
+            y|Y|yes) rm -rf "$SAMMY_HOME"; echo "Deleted local data." ;;
+            *) echo "Kept local data ($SAMMY_HOME)." ;;
+          esac
+        else
+          echo "Kept local data ($SAMMY_HOME). Re-run 'sammy uninstall --purge' to delete it."
+        fi
+        ;;
+    esac
+    echo
+    echo "Sammy uninstalled. Left in place (remove manually if you want):"
+    echo "  - this project folder:  $APP_DIR   (rm -rf \"$APP_DIR\")"
+    echo "  - Ollama + downloaded models (e.g. 'brew uninstall ollama', or delete ~/.ollama)"
+    exit 0
+    ;;
+  status)
+    print_status
+    exit $?
+    ;;
+  start)
+    [ -f "$LAN_FLAG" ] || confirm_network_exposure
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+if ! is_running; then
+  if ! start_with_launch_agent; then
+    start_server
+  fi
+  for _ in $(seq 1 80); do
+    if is_running; then
+      break
+    fi
+    sleep 0.15
+  done
+fi
+
+if ! is_running; then
+  echo "Sammy did not start. See $LOG_FILE"
+  exit 1
+fi
+
+if [ "${SAMMY_NO_BROWSER:-}" != "1" ]; then
+  focus_or_open
+fi
+print_access_urls
