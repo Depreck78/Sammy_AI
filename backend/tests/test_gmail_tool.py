@@ -30,13 +30,13 @@ def normalize_newlines(value):
 class GmailToolTests(unittest.TestCase):
     def test_send_email_treats_br_body_as_html_with_plain_text_fallback(self) -> None:
         tool = GmailTool({"access_token": "token"})
-        body = "Dear Rachael,<br><br>Thank you for your help.<br><br>Warm regards,<br>Erick"
+        body = "Dear Jordan,<br><br>Thank you for your help.<br><br>Warm regards,<br>Sam"
 
         with patch("tools.gmail_tool.requests.post", return_value=FakeResponse({"id": "sent-1"})) as post:
             result = tool.execute(
                 "gmail_send_email",
                 {
-                    "to": "Rachael <rachael@example.com>",
+                    "to": "Jordan <jordan@example.com>",
                     "subject": "Thanks",
                     "body": body,
                 },
@@ -46,7 +46,7 @@ class GmailToolTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertNotIn("threadId", payload)
         message = decode_raw_message(payload["raw"])
-        self.assertEqual("Rachael <rachael@example.com>", message["To"])
+        self.assertEqual("Jordan <jordan@example.com>", message["To"])
         self.assertEqual("Thanks", message["Subject"])
         self.assertTrue(message.is_multipart())
 
@@ -55,7 +55,7 @@ class GmailToolTests(unittest.TestCase):
             for part in message.walk()
             if part.get_content_maintype() != "multipart"
         }
-        self.assertIn("Dear Rachael,\n\nThank you for your help.", normalize_newlines(parts["text/plain"]))
+        self.assertIn("Dear Jordan,\n\nThank you for your help.", normalize_newlines(parts["text/plain"]))
         self.assertIn("<br><br>", parts["text/html"])
 
     def test_reply_email_preserves_gmail_thread_and_reply_headers(self) -> None:
@@ -65,7 +65,7 @@ class GmailToolTests(unittest.TestCase):
             "threadId": "thread-1",
             "payload": {
                 "headers": [
-                    {"name": "From", "value": "Rachael <rachael@example.com>"},
+                    {"name": "From", "value": "Jordan <jordan@example.com>"},
                     {"name": "Reply-To", "value": "Visas Boston <visas@example.com>"},
                     {"name": "Subject", "value": "SEVIS history"},
                     {"name": "Message-ID", "value": "<original@example.com>"},
