@@ -6,6 +6,29 @@ Sammy is a local, private AI agent for Ollama models — your chats and data sta
 
 > **Platforms:** Sammy's app (web UI + Python backend + Ollama) runs on **macOS, Linux, and Windows**. The one-command installer and the `sammy` CLI below are tuned for **macOS**; on Linux/Windows, run it manually — see [Run on Linux / Windows](#run-on-linux--windows-manual).
 
+## System requirements
+
+Sammy's backend and UI are lightweight — the real requirement is **Ollama running a local model**, which is bound mostly by **RAM** (and, for speed, the GPU / Apple Silicon). `setup.sh` auto-selects the base model to fit your RAM:
+
+| Detected RAM | Base model | Experience |
+| --- | --- | --- |
+| **≥ 16 GB** | `gemma2:9b` (default) | Sammy running well |
+| **≥ 12 GB** | `llama3.1:8b` | Good, slightly smaller model |
+| **< 12 GB** | `llama3.2:3b` | Runs, but a weaker/faster fallback |
+
+**Recommended (runs well):** 16 GB+ RAM on an **Apple Silicon Mac (M1 or newer)**, where unified memory is shared with the GPU. 24–32 GB gives headroom for other apps and larger context windows.
+
+**Minimum (runs at all):** 8 GB RAM, which uses the `llama3.2:3b` fallback — fine for trying Sammy, weaker for real tool use.
+
+**Also good to know:**
+- **Disk:** ~10 GB free — Ollama plus a base model is several GB (3B ≈ 2 GB, 8–9B ≈ 5–6 GB); the custom `sammy` model is a thin layer on top.
+- **Mac chip matters:** Apple Silicon is GPU-accelerated and smooth; **Intel Macs run CPU-only and are slow**, even with enough RAM.
+- **PC / Linux:** runs fine; for good speed use a dedicated GPU with ~8 GB VRAM for the 8–9B models, otherwise it falls back to CPU + system RAM.
+- **Offline by design:** once models are pulled, core chat needs no internet. Only optional pieces reach out — web search, Gmail/Zoho tools, and ElevenLabs TTS (the Eagle voice-auth model runs locally in your browser).
+- **Browser:** voice input (Web Speech API) needs **Chrome or Edge**; text chat works in any modern browser.
+
+Override the auto-picked model with `SAMMY_MODEL=llama3.1:8b ./setup.sh`.
+
 ## Install (macOS)
 
 **One line, from scratch:**
