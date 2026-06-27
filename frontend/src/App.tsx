@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import {
   AlertTriangle,
   Archive,
+  ArrowLeft,
   AudioLines,
   Bot,
   BriefcaseBusiness,
@@ -28,6 +29,7 @@ import {
   Heart,
   Lightbulb,
   ListFilter,
+  Lock,
   Mail,
   Mic,
   MicOff,
@@ -37,6 +39,8 @@ import {
   PenLine,
   Pin,
   PinOff,
+  FileText,
+  History,
   Plug,
   Plus,
   RefreshCcw,
@@ -85,8 +89,10 @@ const SPOKEN_SHORT_REPLY_MAX_CHARS = 360;
 const SPOKEN_SUMMARY_DETAIL_HINT = "I put the details in the chat.";
 const FULL_SPEECH_MAX_CHARS = 5000;
 // After the first "Sammy …", the user stays "engaged" and can keep talking without the wake
-// word. Engagement re-arms (wake word required again) after this much silence.
-const ENGAGE_WINDOW_MS = 45000;
+// word. The window (re)starts the moment Sammy finishes its reply and resets on every follow-up,
+// so a normal back-and-forth — including pausing to read a reply — never needs the wake word again.
+// It only re-arms (wake word required) after this much true silence.
+const ENGAGE_WINDOW_MS = 150000;
 // Voice authentication (Picovoice Eagle): accept a command only if the enrolled owner's voice
 // scored at least this much within OWNER_RECENT_MS before the transcript finalized.
 const VOICE_AUTH_MATCH_THRESHOLD = 0.5;
@@ -170,6 +176,11 @@ const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\
 // Wake-word matcher for the active identity, tolerant of a leading greeting in the selected
 // language ("hi Sammy" / "hola Sammy" / "你好 Sammy") or no greeting at all. Sammy keeps its
 // fuzzy mishearing variants (Sammie / Sammi / Sammey).
+//
+// Anchored to the START of the phrase (after an optional greeting): the name only counts as a wake
+// word when the user is actually addressing Sammy. If there's other speech before the name
+// ("email Sammy the report"), this won't match, so a mid-sentence "Sammy" never gets mistaken for
+// the start of a new command — when already engaged the whole phrase is sent as one command.
 function wakeWordRe(name: string, lang = "en"): RegExp {
   const trimmed = name.trim();
   const namePart =
@@ -178,7 +189,7 @@ function wakeWordRe(name: string, lang = "en"): RegExp {
       : `${escapeRegExp(trimmed)}(?:'s)?`;
   const greets = Array.from(new Set([...(WAKE_GREETINGS[lang] ?? []), ...WAKE_GREETINGS.en]));
   const greetAlt = greets.map(escapeRegExp).join("|");
-  return new RegExp(`(?:\\b(?:${greetAlt})\\b[\\s,]*)?\\b${namePart}\\b[\\s,.:;!?-]*(.*)`, "i");
+  return new RegExp(`^[\\s,.!?-]*(?:\\b(?:${greetAlt})\\b[\\s,]*)?\\b${namePart}\\b[\\s,.:;!?-]*(.*)`, "i");
 }
 
 type ModelInfo = {
@@ -298,7 +309,7 @@ type SettingsShape = {
   think: boolean;
   theme: "dark" | "light";
   access_password_enabled: boolean;
-  memory_mode: "auto" | "ask" | "off";
+  memory_mode: "auto" | "ask";
   memory_recall_enabled: boolean;
   memory_recall_limit: number;
   elevenlabs_enabled: boolean;
@@ -309,6 +320,10 @@ type SettingsShape = {
   picovoice_speaker_profile: string;
   active_bestie_id: string;
   gemini_configured: boolean;
+  files_allow_desktop: boolean;
+  files_allow_documents: boolean;
+  files_allow_downloads: boolean;
+  files_output_dir: string;
 };
 
 type ElevenLabsVoice = {
@@ -338,6 +353,29 @@ type MemoryEntry = {
 type MemoryResponse = {
   memories: MemoryEntry[];
   stats: { active: number; pending: number; archived: number };
+};
+
+type MemoryFile = {
+  scope: "soul" | "user" | "agent";
+  agent_id: string;
+  label: string;
+  file_name: string;
+  active_count: number;
+  total_count: number;
+  change_count: number;
+  last_changed_at: string | null;
+};
+
+type MemoryChange = {
+  id: string;
+  memory_id: string;
+  scope: "soul" | "user" | "agent";
+  agent_id: string;
+  action: string;
+  before_content: string | null;
+  after_content: string | null;
+  source_label: string;
+  created_at: string;
 };
 
 type AuthStatus = {
@@ -1817,6 +1855,41 @@ function AgentPickerModal({
   );
 }
 
+// Compact "2h ago" / "3d ago" style timestamp for the memory change log.
+function timeAgo(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (secs < 45) return "just now";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+// Visual treatment for each kind of memory change in the history timeline.
+const MEMORY_ACTION_META: Record<string, { label: string; icon: LucideIcon; tone: string }> = {
+  created: { label: "Created", icon: Plus, tone: "var(--green)" },
+  edited: { label: "Edited", icon: PenLine, tone: "var(--accent)" },
+  updated: { label: "Updated", icon: PenLine, tone: "var(--accent)" },
+  approved: { label: "Approved", icon: Check, tone: "var(--green)" },
+  restored: { label: "Restored", icon: RefreshCcw, tone: "var(--accent)" },
+  queued: { label: "Queued", icon: History, tone: "var(--muted)" },
+  archived: { label: "Archived", icon: Archive, tone: "var(--muted)" },
+  deleted: { label: "Deleted", icon: Trash2, tone: "var(--red)" },
+};
+
+// Grow a textarea to fit its content so long memory lines stay fully visible while editing.
+function autosizeTextarea(el: HTMLTextAreaElement | null) {
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${el.scrollHeight}px`;
+}
+
 function MemorySettings({
   settings,
   onUpdate,
@@ -1833,21 +1906,51 @@ function MemorySettings({
     memories: [],
     stats: { active: 0, pending: 0, archived: 0 },
   });
-  const [filter, setFilter] = useState<"active" | "pending" | "archived">("active");
-  const [query, setQuery] = useState("");
-  const [scope, setScope] = useState<"soul" | "user" | "agent">("user");
-  const [agentId, setAgentId] = useState(agents[0]?.id || "default");
-  const [content, setContent] = useState("");
-  const [editingId, setEditingId] = useState("");
-  const [editingContent, setEditingContent] = useState("");
   const [loading, setLoading] = useState(true);
+  const [files, setFiles] = useState<MemoryFile[]>([]);
+  // null = the file library (grid of document tiles); otherwise the focused file's key.
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  // Which pane shows inside an open file.
+  const [fileTab, setFileTab] = useState<"content" | "history">("content");
+  // Read vs. edit for the open file's contents.
+  const [editing, setEditing] = useState(false);
+  const [draftLine, setDraftLine] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
+  const [changes, setChanges] = useState<MemoryChange[]>([]);
+  const [changesLoading, setChangesLoading] = useState(false);
+  const addLineRef = useRef<HTMLTextAreaElement>(null);
 
-  const refresh = async () => {
-    setLoading(true);
+  const fileKey = (file: MemoryFile) => (file.scope === "agent" ? `agent:${file.agent_id}` : file.scope);
+  const selectedFile = openKey ? files.find((file) => fileKey(file) === openKey) || null : null;
+
+  // `silent` refreshes update the data in place without flashing the full-panel spinner — used
+  // after edits so editing a line doesn't blink the whole section back to "Loading memory...".
+  const refresh = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
-      setData(await api<MemoryResponse>("/api/memories"));
+      const [memoryData, fileData] = await Promise.all([
+        api<MemoryResponse>("/api/memories"),
+        api<{ files: MemoryFile[] }>("/api/memory/files"),
+      ]);
+      setData(memoryData);
+      setFiles(fileData.files);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
+    }
+  };
+
+  const loadChanges = async () => {
+    setChangesLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (selectedFile) {
+        params.set("scope", selectedFile.scope);
+        if (selectedFile.scope === "agent") params.set("agent_id", selectedFile.agent_id);
+      }
+      const query = params.toString();
+      setChanges((await api<{ changes: MemoryChange[] }>(`/api/memory/changes${query ? `?${query}` : ""}`)).changes);
+    } finally {
+      setChangesLoading(false);
     }
   };
 
@@ -1855,59 +1958,90 @@ function MemorySettings({
     void refresh();
   }, []);
 
-  const addMemory = async () => {
-    if (!content.trim()) return;
+  // Reload the change log whenever History is open, the focused file changes, or entries mutate
+  // (refresh() replaces `files`, so any add/edit/archive/delete keeps the timeline current).
+  useEffect(() => {
+    if (openKey && fileTab === "history") void loadChanges();
+  }, [openKey, fileTab, files]);
+
+  // Keep the "add a line" box sized to its content (it grows as you type, shrinks after adding).
+  useEffect(() => {
+    autosizeTextarea(addLineRef.current);
+  }, [draftLine, openKey, editing, fileTab]);
+
+  const addLine = async () => {
+    if (!selectedFile || !draftLine.trim()) return;
     await api<MemoryEntry>("/api/memories", {
       method: "POST",
       body: JSON.stringify({
-        scope,
-        agent_id: scope === "agent" ? agentId : "",
-        kind: scope === "soul" ? "identity" : "fact",
-        content: content.trim(),
+        scope: selectedFile.scope,
+        agent_id: selectedFile.scope === "agent" ? selectedFile.agent_id : "",
+        kind: selectedFile.scope === "soul" ? "identity" : "fact",
+        content: draftLine.trim(),
         confidence: 1,
       }),
     });
-    setContent("");
-    setFilter("active");
+    setDraftLine("");
     setNotice(t("Memory added locally"));
-    await refresh();
+    await refresh(true);
   };
 
   const approve = async (id: string) => {
     await api(`/api/memories/${id}/approve`, { method: "POST" });
     setNotice(t("Memory approved"));
-    await refresh();
+    await refresh(true);
   };
 
   const archive = async (id: string) => {
     await api(`/api/memories/${id}`, { method: "PATCH", body: JSON.stringify({ status: "archived" }) });
     setNotice(t("Memory archived"));
-    await refresh();
+    await refresh(true);
   };
 
-  const saveEdit = async (id: string) => {
-    if (!editingContent.trim()) return;
-    await api(`/api/memories/${id}`, {
+  const commitLine = async (entry: MemoryEntry, value: string) => {
+    const next = value.trim();
+    if (!next || next === entry.content) return;
+    await api(`/api/memories/${entry.id}`, {
       method: "PATCH",
-      body: JSON.stringify({ content: editingContent.trim() }),
+      body: JSON.stringify({ content: next }),
     });
-    setEditingId("");
-    setEditingContent("");
     setNotice(t("Memory corrected"));
-    await refresh();
+    await refresh(true);
+  };
+
+  const restore = async (id: string) => {
+    await api(`/api/memories/${id}`, { method: "PATCH", body: JSON.stringify({ status: "active" }) });
+    setNotice(t("Memory restored"));
+    await refresh(true);
   };
 
   const remove = async (id: string) => {
     await api(`/api/memories/${id}`, { method: "DELETE" });
     setNotice(t("Memory deleted"));
-    await refresh();
+    await refresh(true);
   };
 
-  const visible = data.memories.filter((entry) => {
-    if (entry.status !== filter) return false;
-    const needle = query.trim().toLowerCase();
-    return !needle || `${entry.content} ${entry.kind} ${entry.source_label}`.toLowerCase().includes(needle);
-  });
+  const entryInFile = (entry: MemoryEntry, file: MemoryFile) =>
+    entry.scope === file.scope && (file.scope !== "agent" || entry.agent_id === file.agent_id);
+  const fileEntries = (file: MemoryFile, status: MemoryEntry["status"]) =>
+    data.memories.filter((entry) => entry.status === status && entryInFile(entry, file));
+  const fileLabel = (file: MemoryFile) =>
+    file.scope === "agent" ? `${t("Agent")}: ${file.label}` : t(file.label);
+  const glyphFor = (file: MemoryFile) =>
+    file.scope === "soul" ? Lock : file.scope === "agent" ? Bot : Brain;
+  const openFile = (file: MemoryFile) => {
+    setOpenKey(fileKey(file));
+    setFileTab("content");
+    setEditing(false);
+    setShowArchived(false);
+  };
+  // Edit / History pills in the open file's top-right corner.
+  const toolBtn = (active: boolean) =>
+    `flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition ${
+      active
+        ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+        : "border-[var(--line)] bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--ink)]"
+    }`;
 
   return (
     <div className="space-y-5">
@@ -1928,9 +2062,9 @@ function MemorySettings({
 
       <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
         <div>
-          <div className="mb-1.5 text-xs font-medium text-[var(--muted)]">{t("Post-turn review")}</div>
+          <div className="mb-1.5 text-xs font-medium text-[var(--muted)]">{t("Memory updates")}</div>
           <div className="flex w-fit rounded-lg bg-[var(--inset)] p-1">
-            {(["auto", "ask", "off"] as const).map((mode) => (
+            {(["auto", "ask"] as const).map((mode) => (
               <button
                 key={mode}
                 type="button"
@@ -1960,137 +2094,267 @@ function MemorySettings({
         </label>
       </div>
 
-      <div className="border-y border-[var(--line)] py-4">
-        <div className="mb-2 flex flex-wrap gap-2">
-          <select
-            value={scope}
-            onChange={(event) => setScope(event.target.value as typeof scope)}
-            className="rounded-lg border border-[var(--line)] bg-[var(--inset)] px-2.5 py-2 text-sm"
-            title={t("Memory scope")}
-          >
-            <option value="user">{t("User")}</option>
-            <option value="agent">{t("Agent")}</option>
-            <option value="soul">{t("Soul")}</option>
-          </select>
-          {scope === "agent" ? (
-            <select
-              value={agentId}
-              onChange={(event) => setAgentId(event.target.value)}
-              className="min-w-36 rounded-lg border border-[var(--line)] bg-[var(--inset)] px-2.5 py-2 text-sm"
-            >
-              {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
-            </select>
-          ) : null}
-        </div>
-        <div className="flex gap-2">
-          <input
-            value={content}
-            onChange={(event) => setContent(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") void addMemory();
-            }}
-            placeholder={scope === "soul" ? t("Add a shared identity or behavior rule") : t("Add a durable fact or preference")}
-            className="min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-[var(--inset)] px-3 py-2 text-sm focus:border-[var(--accent)]"
-          />
-          <button
-            type="button"
-            onClick={() => void addMemory()}
-            disabled={!content.trim()}
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--accent-ink)] disabled:opacity-40"
-            title={t("Add memory")}
-            aria-label={t("Add memory")}
-          >
-            <Plus size={16} />
-          </button>
-        </div>
-      </div>
-
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex rounded-lg bg-[var(--inset)] p-1">
-          {(["active", "pending", "archived"] as const).map((status) => (
-            <button
-              key={status}
-              type="button"
-              onClick={() => setFilter(status)}
-              className={`rounded-md px-2.5 py-1.5 text-xs capitalize ${filter === status ? "bg-[var(--surface)] text-[var(--ink)]" : "text-[var(--muted)]"}`}
-            >
-              {t(status)} {data.stats[status]}
-            </button>
-          ))}
-        </div>
-        <label className="relative min-w-44 flex-1 sm:max-w-56">
-          <Search size={14} className="absolute left-2.5 top-2.5 text-[var(--muted)]" />
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder={t("Filter memory")}
-            className="w-full rounded-lg border border-[var(--line)] bg-[var(--inset)] py-2 pl-8 pr-2 text-xs"
-          />
-        </label>
-      </div>
-
-      <div className="divide-y divide-[var(--line)] border-y border-[var(--line)]">
-        {loading ? <div className="py-8 text-center text-sm text-[var(--muted)]">{t("Loading memory...")}</div> : null}
-        {!loading && !visible.length ? <div className="py-8 text-center text-sm text-[var(--muted)]">{t("No {filter} memories", { filter: t(filter) })}</div> : null}
-        {visible.map((entry) => (
-          <div key={entry.id} className="py-3.5">
-            <div className="flex items-start gap-3">
-              <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${entry.scope === "soul" ? "bg-[var(--accent-soft)] text-[var(--accent)]" : "bg-[var(--inset)] text-[var(--muted)]"}`}>
-                {entry.scope === "soul" ? <ShieldCheck size={14} /> : <Brain size={14} />}
-              </span>
-              <div className="min-w-0 flex-1">
-                {editingId === entry.id ? (
-                  <div className="flex gap-2">
-                    <input
-                      value={editingContent}
-                      onChange={(event) => setEditingContent(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") void saveEdit(entry.id);
-                        if (event.key === "Escape") setEditingId("");
-                      }}
-                      className="min-w-0 flex-1 rounded-lg border border-[var(--accent)] bg-[var(--inset)] px-2.5 py-1.5 text-sm"
-                      aria-label={t("Edit memory")}
-                    />
-                    <button type="button" onClick={() => void saveEdit(entry.id)} className="rounded-full p-2 text-[var(--green)] hover:bg-[var(--surface-2)]" title={t("Save edit")} aria-label={t("Save edit")}><Check size={15} /></button>
+      {loading ? (
+        <div className="py-10 text-center text-sm text-[var(--muted)]">{t("Loading memory...")}</div>
+      ) : !selectedFile ? (
+        /* Library: every memory file as a document tile (click one to open it full-width). */
+        <div className="border-t border-[var(--line)] pt-5">
+          <div className="mb-3 flex items-center gap-1.5 text-xs font-medium text-[var(--muted)]">
+            <FileText size={13} /> {t("Memory files")}
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {files.map((file) => {
+              const key = fileKey(file);
+              const Glyph = glyphFor(file);
+              const preview = fileEntries(file, "active").slice(0, 3);
+              const pendingCount = fileEntries(file, "pending").length;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => openFile(file)}
+                  className="group relative flex h-full flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--surface)] text-left shadow-lift transition hover:-translate-y-0.5 hover:shadow-popover"
+                >
+                  {/* Folded paper corner — the signature "this is a document" cue. */}
+                  <span
+                    aria-hidden
+                    className="pointer-events-none absolute right-0 top-0 h-5 w-5"
+                    style={{
+                      clipPath: "polygon(0 0, 100% 0, 100% 100%)",
+                      background: "var(--surface-2)",
+                      boxShadow: "inset 1px -1px 2px rgba(0,0,0,0.10)",
+                    }}
+                  />
+                  <div className="min-h-[96px] flex-1 px-4 pb-3 pt-4">
+                    {preview.length ? (
+                      <div className="space-y-1.5">
+                        {preview.map((entry) => (
+                          <div key={entry.id} className="truncate text-xs leading-relaxed text-[var(--ink)]">
+                            {entry.content}
+                          </div>
+                        ))}
+                        {file.active_count > preview.length ? (
+                          <div className="text-xs text-[var(--muted)]">
+                            {t("+{n} more", { n: file.active_count - preview.length })}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="h-1.5 w-3/4 rounded-full bg-[var(--line)]" />
+                        <div className="h-1.5 w-1/2 rounded-full bg-[var(--line)]" />
+                        <div className="pt-1 text-xs text-[var(--muted)]">{t("Empty file")}</div>
+                      </div>
+                    )}
                   </div>
-                ) : (
-                  <div className="text-sm leading-relaxed">{entry.content}</div>
-                )}
-                <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[0.66rem] text-[var(--muted)]">
-                  <span>{entry.scope}{entry.scope === "agent" ? ` · ${agents.find((agent) => agent.id === entry.agent_id)?.name || entry.agent_id}` : ""}</span>
-                  <span>{entry.kind}</span>
-                  <span>{t("{n}% confidence", { n: Math.round(entry.confidence * 100) })}</span>
-                  <span>{entry.source_conversation_title || entry.source_label || t("Local")}</span>
-                  {entry.use_count ? <span>{t("recalled {n}x", { n: entry.use_count })}</span> : null}
+                  <div className="flex items-center justify-between gap-2 border-t border-[var(--line)] bg-[var(--inset)] px-3 py-2">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <Glyph size={13} className={file.scope === "soul" ? "text-[var(--accent)]" : "text-[var(--muted)]"} />
+                      <span className="truncate text-sm font-medium">{fileLabel(file)}</span>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      {pendingCount ? (
+                        <span className="rounded-full bg-[var(--accent-soft)] px-1.5 py-0.5 font-mono text-[0.58rem] text-[var(--accent)]">
+                          {t("{n} new", { n: pendingCount })}
+                        </span>
+                      ) : null}
+                      <span className="font-mono text-[0.6rem] text-[var(--muted)]">{file.active_count}</span>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        /* Open file: takes the whole section. Back (left) · Edit + History (right). */
+        (() => {
+          const Glyph = glyphFor(selectedFile);
+          const pending = fileEntries(selectedFile, "pending");
+          const active = fileEntries(selectedFile, "active");
+          const archived = fileEntries(selectedFile, "archived");
+          return (
+            <div className="border-t border-[var(--line)] pt-5">
+              <div className="mb-4 flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => { setOpenKey(null); setEditing(false); setFileTab("content"); }}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--line)] text-[var(--muted)] transition hover:bg-[var(--surface-2)] hover:text-[var(--ink)]"
+                  title={t("Back to files")}
+                  aria-label={t("Back to files")}
+                >
+                  <ArrowLeft size={16} />
+                </button>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 text-sm font-semibold">
+                    <Glyph size={14} className={selectedFile.scope === "soul" ? "text-[var(--accent)]" : "text-[var(--muted)]"} />
+                    <span className="truncate">{fileLabel(selectedFile)}</span>
+                  </div>
+                  <div className="font-mono text-[0.62rem] text-[var(--muted)]">{selectedFile.file_name}</div>
                 </div>
-              </div>
-              <div className="flex shrink-0 gap-1">
-                {editingId !== entry.id ? (
+                <div className="flex shrink-0 items-center gap-1.5">
                   <button
                     type="button"
-                    onClick={() => {
-                      setEditingId(entry.id);
-                      setEditingContent(entry.content);
-                    }}
-                    className="rounded-full p-2 text-[var(--muted)] hover:bg-[var(--surface-2)]"
-                    title={t("Edit memory")}
-                    aria-label={t("Edit memory")}
+                    onClick={() => { setFileTab("content"); setEditing((value) => !value); }}
+                    className={toolBtn(editing && fileTab === "content")}
                   >
-                    <PenLine size={15} />
+                    {editing && fileTab === "content" ? <Check size={13} /> : <PenLine size={13} />}
+                    {editing && fileTab === "content" ? t("Done") : t("Edit")}
                   </button>
-                ) : null}
-                {entry.status === "pending" ? (
-                  <button type="button" onClick={() => void approve(entry.id)} className="rounded-full p-2 text-[var(--green)] hover:bg-[var(--surface-2)]" title={t("Approve memory")} aria-label={t("Approve memory")}><Check size={15} /></button>
-                ) : null}
-                {entry.status !== "archived" ? (
-                  <button type="button" onClick={() => void archive(entry.id)} className="rounded-full p-2 text-[var(--muted)] hover:bg-[var(--surface-2)]" title={t("Archive memory")} aria-label={t("Archive memory")}><Archive size={15} /></button>
-                ) : null}
-                <button type="button" onClick={() => void remove(entry.id)} className="rounded-full p-2 text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--red)]" title={t("Delete memory")} aria-label={t("Delete memory")}><Trash2 size={15} /></button>
+                  <button
+                    type="button"
+                    onClick={() => setFileTab((tab) => (tab === "history" ? "content" : "history"))}
+                    className={toolBtn(fileTab === "history")}
+                  >
+                    <History size={13} /> {t("History")}
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-[var(--line)] bg-[var(--surface)] p-4 shadow-lift sm:p-5">
+                {fileTab === "history" ? (
+                  changesLoading ? (
+                    <div className="py-8 text-center text-sm text-[var(--muted)]">{t("Loading history...")}</div>
+                  ) : !changes.length ? (
+                    <div className="py-8 text-center text-sm text-[var(--muted)]">{t("No changes recorded yet.")}</div>
+                  ) : (
+                    <div className="divide-y divide-[var(--line)]">
+                      {changes.map((change) => {
+                        const meta = MEMORY_ACTION_META[change.action] || { label: change.action, icon: History, tone: "var(--muted)" };
+                        const Icon = meta.icon;
+                        return (
+                          <div key={change.id} className="flex items-start gap-3 py-3">
+                            <span
+                              className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--inset)]"
+                              style={{ color: meta.tone }}
+                            >
+                              <Icon size={14} />
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <div className="text-sm font-medium" style={{ color: meta.tone }}>{t(meta.label)}</div>
+                              {change.action === "edited" && change.before_content ? (
+                                <div className="mt-1 space-y-0.5 text-sm leading-relaxed">
+                                  <div className="text-[var(--muted)] line-through">{change.before_content}</div>
+                                  <div>{change.after_content}</div>
+                                </div>
+                              ) : (
+                                <div className="mt-1 text-sm leading-relaxed">{change.after_content || change.before_content}</div>
+                              )}
+                              <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[0.66rem] text-[var(--muted)]">
+                                <span>{timeAgo(change.created_at)}</span>
+                                {change.source_label ? <span>{change.source_label}</span> : null}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )
+                ) : (
+                  <>
+                    {pending.length ? (
+                      <div className="mb-4 space-y-2 rounded-lg border border-[var(--accent)] bg-[var(--accent-soft)] p-3">
+                        <div className="text-xs font-medium text-[var(--accent)]">{t("Suggested by Sammy")}</div>
+                        {pending.map((entry) => (
+                          <div key={entry.id} className="flex items-start gap-2">
+                            <div className="min-w-0 flex-1 text-sm leading-relaxed">{entry.content}</div>
+                            <button type="button" onClick={() => void approve(entry.id)} className="shrink-0 rounded-full p-1.5 text-[var(--green)] hover:bg-[var(--surface)]" title={t("Approve memory")} aria-label={t("Approve memory")}><Check size={15} /></button>
+                            <button type="button" onClick={() => void archive(entry.id)} className="shrink-0 rounded-full p-1.5 text-[var(--muted)] hover:bg-[var(--surface)]" title={t("Dismiss")} aria-label={t("Dismiss")}><X size={15} /></button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+
+                    {!active.length && !editing ? (
+                      <div className="py-6 text-center text-sm text-[var(--muted)]">{t("This file is empty.")}</div>
+                    ) : null}
+
+                    {editing ? (
+                      <div className="space-y-2">
+                        {active.map((entry) => (
+                          <div key={entry.id} className="flex items-start gap-2">
+                            <textarea
+                              ref={autosizeTextarea}
+                              rows={1}
+                              defaultValue={entry.content}
+                              onInput={(event) => autosizeTextarea(event.currentTarget)}
+                              onBlur={(event) => void commitLine(entry, event.target.value)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" && !event.shiftKey) {
+                                  event.preventDefault();
+                                  event.currentTarget.blur();
+                                }
+                                if (event.key === "Escape") {
+                                  event.currentTarget.value = entry.content;
+                                  autosizeTextarea(event.currentTarget);
+                                  event.currentTarget.blur();
+                                }
+                              }}
+                              className="min-w-0 flex-1 resize-none overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--inset)] px-3 py-2 text-sm leading-relaxed focus:border-[var(--accent)]"
+                              aria-label={t("Edit memory")}
+                            />
+                            <button type="button" onClick={() => void remove(entry.id)} className="mt-0.5 shrink-0 rounded-full p-2 text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--red)]" title={t("Delete memory")} aria-label={t("Delete memory")}><Trash2 size={15} /></button>
+                          </div>
+                        ))}
+                        <div className="flex items-start gap-2 pt-1">
+                          <textarea
+                            ref={addLineRef}
+                            rows={1}
+                            value={draftLine}
+                            onChange={(event) => setDraftLine(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" && !event.shiftKey) {
+                                event.preventDefault();
+                                void addLine();
+                              }
+                            }}
+                            placeholder={selectedFile.scope === "soul" ? t("Add an identity or behavior rule") : t("Add a durable fact or preference")}
+                            className="min-w-0 flex-1 resize-none overflow-hidden rounded-lg border border-dashed border-[var(--line-strong)] bg-[var(--inset)] px-3 py-2 text-sm leading-relaxed focus:border-[var(--accent)]"
+                          />
+                          <button type="button" onClick={() => void addLine()} disabled={!draftLine.trim()} className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--accent-ink)] disabled:opacity-40" title={t("Add memory")} aria-label={t("Add memory")}><Plus size={16} /></button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-[var(--line)]">
+                        {active.map((entry) => (
+                          <div key={entry.id} className="flex items-start gap-2.5 py-2.5">
+                            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--line-strong)]" />
+                            <div className="min-w-0 flex-1 text-sm leading-relaxed">{entry.content}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {archived.length ? (
+                      <div className="mt-4 border-t border-[var(--line)] pt-3">
+                        <button
+                          type="button"
+                          onClick={() => setShowArchived((value) => !value)}
+                          className="flex items-center gap-1.5 text-xs text-[var(--muted)] hover:text-[var(--ink)]"
+                        >
+                          <Archive size={12} /> {t("Archived")} ({archived.length})
+                          <ChevronDown size={12} className={showArchived ? "rotate-180 transition" : "transition"} />
+                        </button>
+                        {showArchived ? (
+                          <div className="mt-2 divide-y divide-[var(--line)]">
+                            {archived.map((entry) => (
+                              <div key={entry.id} className="flex items-center gap-2 py-2">
+                                <div className="min-w-0 flex-1 text-sm text-[var(--muted)] line-through">{entry.content}</div>
+                                <button type="button" onClick={() => void restore(entry.id)} className="shrink-0 rounded-full p-1.5 text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--ink)]" title={t("Restore memory")} aria-label={t("Restore memory")}><RefreshCcw size={14} /></button>
+                                <button type="button" onClick={() => void remove(entry.id)} className="shrink-0 rounded-full p-1.5 text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--red)]" title={t("Delete memory")} aria-label={t("Delete memory")}><Trash2 size={14} /></button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </>
+                )}
               </div>
             </div>
-          </div>
-        ))}
-      </div>
+          );
+        })()
+      )}
     </div>
   );
 }
@@ -2206,7 +2470,8 @@ function DocsSettings({ tools }: { tools: ToolInfo[] }) {
         <p className="text-[var(--muted)]">
           On another Mac, one command installs everything — Sammy, Ollama, and a default model — then launches it:
         </p>
-        <DocsCode>curl -fsSL https://raw.githubusercontent.com/Depreck78/Sammy_AI/main/install.sh | bash</DocsCode>
+        <DocsCode>curl -fsSL https://raw.githubusercontent.com/REPLACE_ME/sammy/main/install.sh | bash</DocsCode>
+        <p className="text-xs text-[var(--muted)]">(That URL works once the project's public repo exists.)</p>
         <p className="mt-2 text-[var(--muted)]">Already have the project folder? Run the installer inside it:</p>
         <DocsCode>./setup.sh</DocsCode>
         <p className="text-[var(--muted)]">
@@ -2703,6 +2968,15 @@ function SettingsPanel({
     setGeminiKeyDraft("");
   };
 
+  const chooseOutputFolder = async () => {
+    try {
+      const res = await api<{ path: string }>("/api/files/choose-folder", { method: "POST" });
+      if (res.path) updateSetting({ files_output_dir: res.path });
+    } catch (error) {
+      setNotice((error as Error).message);
+    }
+  };
+
   const saveAccessPassword = async () => {
     if (clearAccessPassword) {
       await persistSettings({ clear_access_password: true });
@@ -2920,6 +3194,59 @@ function SettingsPanel({
           {(tab === "general" || tab === "voice" || tab === "security") && (
             <div className="mx-auto max-w-2xl space-y-5">
               {tab === "security" ? <NetworkModeCard /> : null}
+              <section className={["rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-5 shadow-lift", tab === "security" ? "" : "hidden"].join(" ")}>
+                <h3 className="font-display text-base font-semibold tracking-tight">{t("Files & folders")}</h3>
+                <p className="mt-0.5 text-sm text-[var(--muted)]">{t("Choose which folders Sammy may read and write, and where it saves files it creates.")}</p>
+                <div className="mt-4 space-y-3">
+                  {([
+                    ["files_allow_desktop", "Allow access to Desktop"],
+                    ["files_allow_documents", "Allow access to Documents"],
+                    ["files_allow_downloads", "Allow access to Downloads"],
+                  ] as const).map(([key, label]) => (
+                    <label key={key} className="flex items-center justify-between gap-4">
+                      <span className="text-sm font-medium text-[var(--ink)]">{t(label)}</span>
+                      <span className="relative inline-flex shrink-0 items-center">
+                        <input
+                          type="checkbox"
+                          className="peer sr-only"
+                          checked={Boolean(settings[key])}
+                          onChange={(event) => updateSetting({ [key]: event.target.checked } as Partial<SettingsShape>)}
+                        />
+                        <span className="peer h-5 w-9 rounded-full bg-[var(--line)] after:absolute after:left-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:bg-[var(--surface)] after:transition-all after:content-[''] peer-checked:bg-[var(--accent)] peer-checked:after:translate-x-full" />
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-5">
+                  <span className="mb-1.5 block text-sm font-medium text-[var(--ink)]">{t("Save Sammy's documents in")}</span>
+                  <div className="flex gap-2">
+                    <input
+                      readOnly
+                      value={settings.files_output_dir}
+                      placeholder={t("No folder chosen (defaults to the Sammy app folder)")}
+                      className="min-w-0 flex-1 truncate rounded-xl border border-[var(--line)] bg-[var(--inset)] px-3 py-2.5 text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void chooseOutputFolder()}
+                      className="shrink-0 rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--accent-ink)] hover:brightness-105"
+                    >
+                      {t("Choose…")}
+                    </button>
+                    {settings.files_output_dir ? (
+                      <button
+                        type="button"
+                        onClick={() => updateSetting({ files_output_dir: "" })}
+                        className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--ink)] hover:bg-[var(--surface-2)]"
+                      >
+                        {t("Clear")}
+                      </button>
+                    ) : null}
+                  </div>
+                  <span className="mt-1.5 block text-xs text-[var(--muted)]">{t("Sammy saves files it creates here unless you tell it another folder.")}</span>
+                </div>
+              </section>
+
               <section className={["rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-5 shadow-lift", tab === "general" ? "" : "hidden"].join(" ")}>
                 <h3 className="font-display text-base font-semibold tracking-tight">{t("Model & responses")}</h3>
                 <p className="mt-0.5 text-sm text-[var(--muted)]">{t("Choose a default model and shape how Sammy replies.")}</p>
@@ -3845,13 +4172,6 @@ function SettingsPanel({
                   <span className="truncate">{t("Most changes save automatically.")}</span>
                 )}
               </span>
-              <button
-                type="button"
-                className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--surface)] px-5 py-2 text-sm font-medium text-[var(--ink)] hover:bg-[var(--surface-2)]"
-                onClick={onClose}
-              >
-                {t("Done")}
-              </button>
             </div>
           </div>
         </div>
@@ -4333,6 +4653,10 @@ export default function App() {
     picovoice_speaker_profile: "",
     active_bestie_id: "",
     gemini_configured: false,
+    files_allow_desktop: false,
+    files_allow_documents: false,
+    files_allow_downloads: false,
+    files_output_dir: "",
   });
   const [agents, setAgents] = useState<Agent[]>([]);
   const [besties, setBesties] = useState<Bestie[]>([]);
@@ -5000,8 +5324,34 @@ export default function App() {
     return `${summary} ${SPOKEN_SUMMARY_DETAIL_HINT}`;
   }
 
-  function speechTextForReply(text: string, readFull: boolean) {
-    return readFull ? cleanForSpeech(text, FULL_SPEECH_MAX_CHARS) : spokenSummaryFor(text);
+  // Turn Sammy's written reply into what gets spoken aloud. For a full read-back we speak the
+  // whole thing. Otherwise we ask the model for a genuine, concise spoken summary (key points, any
+  // question Sammy is asking, or a short confirmation for action tasks) — far better than the
+  // first-sentence heuristic, which stays as the offline fallback. Already-short replies are spoken
+  // verbatim so we don't pay for a model round-trip on a one-liner.
+  async function voiceSpeechForReply(text: string, readFull: boolean, question: string) {
+    if (readFull) return cleanForSpeech(text, FULL_SPEECH_MAX_CHARS);
+    const clean = cleanForSpeech(text, FULL_SPEECH_MAX_CHARS);
+    if (!clean) return "";
+    if (wordCount(clean) <= SPOKEN_SHORT_REPLY_MAX_WORDS && clean.length <= SPOKEN_SHORT_REPLY_MAX_CHARS) {
+      return clean;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/voice/summarize`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reply: text, question: question || "", lang }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const spoken = cleanForSpeech(String(data?.summary || ""), 1200);
+        if (spoken) return spoken;
+      }
+    } catch {
+      // fall through to the offline heuristic below
+    }
+    return spokenSummaryFor(text);
   }
 
   function speakText(text: string, maxChars = 1200) {
@@ -5328,10 +5678,16 @@ export default function App() {
       pendingSpeakRef.current = false;
       const readFull = pendingSpeakFullRef.current;
       pendingSpeakFullRef.current = false;
-      const lastAssistant = [...messagesRef.current].reverse().find((message) => message.role === "assistant");
+      const recent = [...messagesRef.current].reverse();
+      const lastAssistant = recent.find((message) => message.role === "assistant");
+      const lastUser = recent.find((message) => message.role === "user");
       const responseStatus = lastAssistant?.metadata?.response_status;
       if (lastAssistant?.content && responseStatus !== "error" && responseStatus !== "stopped") {
-        speakText(speechTextForReply(lastAssistant.content, readFull), readFull ? FULL_SPEECH_MAX_CHARS : 1200);
+        const reply = lastAssistant.content;
+        void (async () => {
+          const spoken = await voiceSpeechForReply(reply, readFull, lastUser?.content || "");
+          if (voiceModeRef.current && spoken) speakText(spoken, readFull ? FULL_SPEECH_MAX_CHARS : 1200);
+        })();
       }
     }
   }, [generating]);

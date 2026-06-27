@@ -2,6 +2,7 @@ import fnmatch
 from pathlib import Path
 from typing import Any, Dict, List
 
+from app import workspace
 from app.config import APP_ROOT
 from app.tooling import BaseTool
 
@@ -34,20 +35,24 @@ class FileSystemTool(BaseTool):
         ]
 
     def _allowed_roots(self) -> List[Path]:
+        roots = list(workspace.allowed_roots())  # central, user-controlled folders
         raw = self.credentials.get("allowed_directories")
         if isinstance(raw, str):
             values = [line.strip() for line in raw.splitlines() if line.strip()]
         elif isinstance(raw, list):
-            values = raw
+            values = [value for value in raw if value]
         else:
-            values = [str(APP_ROOT)]
-        roots = []
+            values = []
         for value in values:
             try:
                 roots.append(Path(value).expanduser().resolve())
             except Exception:
                 continue
-        return roots or [APP_ROOT.resolve()]
+        deduped: List[Path] = []
+        for root in roots:
+            if root not in deduped:
+                deduped.append(root)
+        return deduped
 
     def _writes_enabled(self) -> bool:
         value = self.credentials.get("allow_writes")
@@ -58,7 +63,7 @@ class FileSystemTool(BaseTool):
     def _resolve_allowed(self, path: str) -> Path:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
-            candidate = APP_ROOT / candidate
+            candidate = workspace.relative_base() / candidate  # bare filename → default output folder
         candidate = candidate.resolve()
         for root in self._allowed_roots():
             if candidate == root or root in candidate.parents:

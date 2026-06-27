@@ -126,6 +126,21 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_memories_lookup
             ON memories(scope, agent_id, status, updated_at);
 
+            CREATE TABLE IF NOT EXISTS memory_changes (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL,
+                agent_id TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL,
+                before_content TEXT,
+                after_content TEXT,
+                source_label TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_changes_file
+            ON memory_changes(scope, agent_id, created_at);
+
             CREATE TABLE IF NOT EXISTS plugin_proposals (
                 id TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL,
@@ -228,6 +243,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "memory_mode": "auto",
     "memory_recall_enabled": True,
     "memory_recall_limit": 5,
+    # Run a periodic memory reconciliation every N user prompts (0 disables it).
+    "memory_review_interval": 10,
     "elevenlabs_enabled": False,
     "elevenlabs_voice_id": "",
     "voice_auth_enabled": False,
@@ -238,6 +255,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gemini_api_key_enc": "",
     # Custom mDNS alias so phones can use http://<alias>.local without renaming the Mac.
     "network_alias": "sammy",
+    # File access for Sammy's tools (Numbers/Excel/filesystem). Folders are opt-in; documents
+    # Sammy creates go to files_output_dir unless the user names another folder.
+    "files_allow_desktop": False,
+    "files_allow_documents": False,
+    "files_allow_downloads": False,
+    "files_output_dir": "",
 }
 
 
@@ -726,6 +749,108 @@ def _memory_row(row: sqlite3.Row) -> Dict[str, Any]:
     return item
 
 
+def record_memory_change(
+    *,
+    memory_id: str,
+    scope: str,
+    agent_id: str,
+    action: str,
+    before_content: Optional[str] = None,
+    after_content: Optional[str] = None,
+    source_label: str = "",
+) -> None:
+    """Append one entry to the per-file memory change log (scope + agent_id = a memory file)."""
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_changes(
+                id, memory_id, scope, agent_id, action,
+                before_content, after_content, source_label, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                memory_id or "",
+                scope,
+                str(agent_id or "") if scope == "agent" else "",
+                action,
+                before_content,
+                after_content,
+                source_label or "",
+                now_iso(),
+            ),
+        )
+
+
+def list_memory_changes(
+    scope: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    if scope:
+        clauses.append("scope = ?")
+        params.append(scope)
+        if scope == "agent" and agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(str(agent_id or ""))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(max(1, min(int(limit), 500)))
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM memory_changes {where} ORDER BY created_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def memory_file_aggregates() -> List[Dict[str, Any]]:
+    with connect() as conn:
+        memory_rows = conn.execute(
+            """
+            SELECT scope, agent_id,
+                   SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_count,
+                   COUNT(*) AS total_count,
+                   MAX(updated_at) AS last_updated
+            FROM memories GROUP BY scope, agent_id
+            """
+        ).fetchall()
+        change_rows = conn.execute(
+            """
+            SELECT scope, agent_id, COUNT(*) AS change_count, MAX(created_at) AS last_changed
+            FROM memory_changes GROUP BY scope, agent_id
+            """
+        ).fetchall()
+    changes = {(row["scope"], row["agent_id"]): row for row in change_rows}
+    result: List[Dict[str, Any]] = []
+    for row in memory_rows:
+        change = changes.pop((row["scope"], row["agent_id"]), None)
+        result.append(
+            {
+                "scope": row["scope"],
+                "agent_id": row["agent_id"],
+                "active_count": row["active_count"] or 0,
+                "total_count": row["total_count"] or 0,
+                "change_count": (change["change_count"] if change else 0),
+                "last_changed_at": (change["last_changed"] if change else None) or row["last_updated"],
+            }
+        )
+    # Files that only have history (e.g. every entry was deleted) still belong in the list.
+    for (scope, agent_id), change in changes.items():
+        result.append(
+            {
+                "scope": scope,
+                "agent_id": agent_id,
+                "active_count": 0,
+                "total_count": 0,
+                "change_count": change["change_count"],
+                "last_changed_at": change["last_changed"],
+            }
+        )
+    return result
+
+
 def add_memory(values: Dict[str, Any]) -> Dict[str, Any]:
     content = re.sub(r"\s+", " ", str(values.get("content") or "").strip())
     if not content:
@@ -775,6 +900,14 @@ def add_memory(values: Dict[str, Any]) -> Dict[str, Any]:
                 stamp,
             ),
         )
+    record_memory_change(
+        memory_id=memory_id,
+        scope=scope,
+        agent_id=agent_id,
+        action="created",
+        after_content=content,
+        source_label=str(values.get("source_label") or ""),
+    )
     return get_memory(memory_id)
 
 
@@ -829,7 +962,7 @@ def list_memories(
     return [_memory_row(row) for row in rows]
 
 
-def update_memory(memory_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
+def update_memory(memory_id: str, values: Dict[str, Any], source: str = "") -> Dict[str, Any]:
     allowed = {"kind", "content", "status", "confidence", "sensitive", "expires_at"}
     updates = {key: value for key, value in values.items() if key in allowed}
     if "content" in updates:
@@ -844,6 +977,7 @@ def update_memory(memory_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
         updates["sensitive"] = int(bool(updates["sensitive"]))
     if not updates:
         return get_memory(memory_id)
+    before = get_memory(memory_id)
     updates["updated_at"] = now_iso()
     assignments = ", ".join(f"{key} = ?" for key in updates)
     with connect() as conn:
@@ -853,14 +987,53 @@ def update_memory(memory_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
         )
     if cursor.rowcount == 0:
         raise KeyError(memory_id)
-    return get_memory(memory_id)
+    after = get_memory(memory_id)
+    action = _memory_change_action(before, after)
+    if action:
+        record_memory_change(
+            memory_id=memory_id,
+            scope=after["scope"],
+            agent_id=after["agent_id"],
+            action=action,
+            before_content=before["content"],
+            after_content=after["content"],
+            source_label=source,
+        )
+    return after
 
 
-def delete_memory(memory_id: str) -> None:
+def _memory_change_action(before: Dict[str, Any], after: Dict[str, Any]) -> str:
+    """Describe a memory update for the change log: status transitions take priority over edits."""
+    if before["status"] != after["status"]:
+        new_status = after["status"]
+        if new_status == "archived":
+            return "archived"
+        if new_status == "active":
+            return "approved" if before["status"] == "pending" else "restored"
+        if new_status == "pending":
+            return "queued"
+        return f"status: {new_status}"
+    if before["content"] != after["content"]:
+        return "edited"
+    if (before["kind"], before["confidence"]) != (after["kind"], after["confidence"]):
+        return "updated"
+    return ""
+
+
+def delete_memory(memory_id: str, source: str = "") -> None:
+    existing = get_memory(memory_id)
     with connect() as conn:
         cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     if cursor.rowcount == 0:
         raise KeyError(memory_id)
+    record_memory_change(
+        memory_id=memory_id,
+        scope=existing["scope"],
+        agent_id=existing["agent_id"],
+        action="deleted",
+        before_content=existing["content"],
+        source_label=source,
+    )
 
 
 def mark_memories_used(memory_ids: Iterable[str]) -> None:
@@ -889,15 +1062,33 @@ def memory_stats() -> Dict[str, int]:
 
 
 def expire_memories() -> int:
+    stamp = now_iso()
     with connect() as conn:
-        cursor = conn.execute(
+        due = conn.execute(
             """
-            UPDATE memories SET status = 'archived', updated_at = ?
+            SELECT id, scope, agent_id, content FROM memories
             WHERE status != 'archived' AND expires_at IS NOT NULL AND expires_at <= ?
             """,
-            (now_iso(), now_iso()),
+            (stamp,),
+        ).fetchall()
+        if not due:
+            return 0
+        conn.execute(
+            "UPDATE memories SET status = 'archived', updated_at = ? WHERE id IN (%s)"
+            % ",".join("?" for _ in due),
+            (stamp, *[row["id"] for row in due]),
         )
-    return cursor.rowcount
+    for row in due:
+        record_memory_change(
+            memory_id=row["id"],
+            scope=row["scope"],
+            agent_id=row["agent_id"],
+            action="archived",
+            before_content=row["content"],
+            after_content=row["content"],
+            source_label="Expired (TTL)",
+        )
+    return len(due)
 
 
 def search_messages(

@@ -7,12 +7,23 @@ from unittest.mock import patch
 import tools.excel_tool as excel_module
 from tools.excel_tool import ExcelTool
 
+from app import db
+
 
 def function_names(tool: ExcelTool) -> set[str]:
     return {definition["function"]["name"] for definition in tool.get_functions()}
 
 
 class ExcelToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The file tools read user folder settings via app.workspace, so they need a database.
+        self._db_dir = tempfile.TemporaryDirectory()
+        self._db_patch = patch.object(db, "DB_PATH", Path(self._db_dir.name) / "sammy.sqlite")
+        self._db_patch.start()
+        self.addCleanup(self._db_dir.cleanup)
+        self.addCleanup(self._db_patch.stop)
+        db.init_db()
+
     def test_create_is_available_without_write_opt_in_for_safe_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

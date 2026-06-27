@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
 
+from app import workspace
 from app.config import APP_ROOT
 from app.tooling import BaseTool
 
@@ -25,8 +26,8 @@ class NumbersTool(BaseTool):
                 "name": "allowed_directories",
                 "label": "Allowed directories",
                 "type": "textarea",
-                "placeholder": str(APP_ROOT),
-                "description": "One absolute directory path per line. Defaults to this Sammy repository only.",
+                "placeholder": f"{APP_ROOT}\n~/Desktop\n~/Documents",
+                "description": "One absolute directory path per line. Defaults to this Sammy repo plus your Desktop, Documents, and Downloads.",
             },
             {
                 "name": "allow_writes",
@@ -37,20 +38,26 @@ class NumbersTool(BaseTool):
         ]
 
     def _allowed_roots(self) -> List[Path]:
+        # Central, user-controlled folders (Settings → Security) plus any extra dirs set on the
+        # tool itself.
+        roots = list(workspace.allowed_roots())
         raw = self.credentials.get("allowed_directories")
         if isinstance(raw, str):
             values = [line.strip() for line in raw.splitlines() if line.strip()]
         elif isinstance(raw, list):
-            values = raw
+            values = [value for value in raw if value]
         else:
-            values = [str(APP_ROOT)]
-        roots = []
+            values = []
         for value in values:
             try:
                 roots.append(Path(value).expanduser().resolve())
             except Exception:
                 continue
-        return roots or [APP_ROOT.resolve()]
+        deduped: List[Path] = []
+        for root in roots:
+            if root not in deduped:
+                deduped.append(root)
+        return deduped
 
     def _writes_enabled(self) -> bool:
         value = self.credentials.get("allow_writes")
@@ -61,7 +68,7 @@ class NumbersTool(BaseTool):
     def _resolve_allowed(self, path: str, suffixes: List[str]) -> Path:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
-            candidate = APP_ROOT / candidate
+            candidate = workspace.relative_base() / candidate  # bare filename → default output folder
         candidate = candidate.resolve()
         if candidate.suffix.lower() not in suffixes:
             raise ValueError(f"Expected one of these file types: {', '.join(suffixes)}")
@@ -128,59 +135,62 @@ class NumbersTool(BaseTool):
         return result.stdout.strip()
 
     def get_functions(self) -> List[Dict[str, Any]]:
-        functions = [
+        # Always expose every function (even when writes are off) so the model can attempt a
+        # create and get a clear "enable Allow Numbers writes" message, instead of dead-ending
+        # by only being able to "open" a file that doesn't exist yet.
+        return [
             self.function(
                 "numbers_open_document",
-                "Open a .numbers spreadsheet in the local Apple Numbers app.",
+                "Open an existing .numbers spreadsheet in the local Apple Numbers app.",
                 {"path": {"type": "string", "description": "Absolute or workspace-relative .numbers path."}},
                 ["path"],
             ),
+            self.function(
+                "numbers_create_document",
+                "Create a new .numbers spreadsheet with optional headers and rows (this is how you make a "
+                "Numbers table/file). Requires Allow Numbers writes.",
+                {
+                    "path": {"type": "string"},
+                    "sheet_name": {"type": "string"},
+                    "table_name": {"type": "string"},
+                    "headers": {"type": "array", "items": {}},
+                    "rows": {"type": "array", "items": {"type": "array", "items": {}}},
+                },
+                ["path"],
+            ),
+            self.function(
+                "numbers_set_cell",
+                "Set one cell in a Numbers document. Requires Allow Numbers writes.",
+                {
+                    "path": {"type": "string"},
+                    "cell": {"type": "string", "description": "Cell address such as A1."},
+                    "value": {},
+                    "sheet_index": {"type": "integer", "minimum": 1},
+                    "table_index": {"type": "integer", "minimum": 1},
+                },
+                ["path", "cell", "value"],
+            ),
+            self.function(
+                "numbers_export_document",
+                "Export a Numbers document to xlsx, csv, or pdf. Requires Allow Numbers writes.",
+                {
+                    "path": {"type": "string"},
+                    "output_path": {"type": "string"},
+                    "format": {"type": "string", "enum": ["xlsx", "csv", "pdf"]},
+                },
+                ["path", "output_path", "format"],
+            ),
         ]
-        if self._writes_enabled():
-            functions.extend(
-                [
-                    self.function(
-                        "numbers_create_document",
-                        "Create a Numbers spreadsheet with optional headers and rows. Requires Allow Numbers writes.",
-                        {
-                            "path": {"type": "string"},
-                            "sheet_name": {"type": "string"},
-                            "table_name": {"type": "string"},
-                            "headers": {"type": "array", "items": {}},
-                            "rows": {"type": "array", "items": {"type": "array", "items": {}}},
-                        },
-                        ["path"],
-                    ),
-                    self.function(
-                        "numbers_set_cell",
-                        "Set one cell in a Numbers document. Requires Allow Numbers writes.",
-                        {
-                            "path": {"type": "string"},
-                            "cell": {"type": "string", "description": "Cell address such as A1."},
-                            "value": {},
-                            "sheet_index": {"type": "integer", "minimum": 1},
-                            "table_index": {"type": "integer", "minimum": 1},
-                        },
-                        ["path", "cell", "value"],
-                    ),
-                    self.function(
-                        "numbers_export_document",
-                        "Export a Numbers document to xlsx, csv, or pdf. Requires Allow Numbers writes.",
-                        {
-                            "path": {"type": "string"},
-                            "output_path": {"type": "string"},
-                            "format": {"type": "string", "enum": ["xlsx", "csv", "pdf"]},
-                        },
-                        ["path", "output_path", "format"],
-                    ),
-                ]
-            )
-        return functions
 
     def _open_document(self, parameters: Dict[str, Any]) -> str:
         path = self._resolve_allowed(parameters["path"], [".numbers"])
         if not path.exists():
-            raise FileNotFoundError(path)
+            hint = (
+                "Create it first with numbers_create_document."
+                if self._writes_enabled()
+                else "Create it with numbers_create_document after enabling “Allow Numbers writes” in the Numbers tool settings."
+            )
+            return f"That Numbers file doesn't exist yet: {path}. {hint}"
         script = f"""
 set sourceFile to POSIX file {self._script_string(str(path))}
 tell application "Numbers"

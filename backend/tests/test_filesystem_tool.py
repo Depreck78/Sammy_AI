@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from app import db
 from app.config import APP_ROOT
 from tools.filesystem_tool import FileSystemTool
 
@@ -11,6 +13,15 @@ def function_names(tool: FileSystemTool) -> set[str]:
 
 
 class FileSystemToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The file tools read user folder settings via app.workspace, so they need a database.
+        self._db_dir = tempfile.TemporaryDirectory()
+        self._db_patch = patch.object(db, "DB_PATH", Path(self._db_dir.name) / "sammy.sqlite")
+        self._db_patch.start()
+        self.addCleanup(self._db_dir.cleanup)
+        self.addCleanup(self._db_patch.stop)
+        db.init_db()
+
     def test_default_is_repo_only_and_read_only(self) -> None:
         tool = FileSystemTool()
 

@@ -1103,6 +1103,99 @@ async def open_voice_settings() -> Dict[str, bool]:
     raise HTTPException(status_code=500, detail="Could not open System Settings (macOS only).")
 
 
+@app.post("/api/files/choose-folder")
+async def choose_folder() -> Dict[str, str]:
+    """Open a native macOS folder picker (its dialog can also create a New Folder). Returns the
+    chosen POSIX path, or "" if the user cancels. macOS-only."""
+    script = (
+        'try\n'
+        '  set chosen to choose folder with prompt "Choose a folder for Sammy\'s documents"\n'
+        '  return POSIX path of chosen\n'
+        'on error number -128\n'  # user cancelled
+        '  return ""\n'
+        'end try'
+    )
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run, ["osascript", "-e", script], capture_output=True, text=True, timeout=180
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open the folder picker: {exc}") from exc
+    return {"path": (result.stdout or "").strip()}
+
+
+class CreateFolderPayload(BaseModel):
+    path: str
+
+
+@app.post("/api/files/create-folder")
+async def create_folder(payload: CreateFolderPayload) -> Dict[str, str]:
+    raw = (payload.path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="No folder path provided.")
+    target = Path(raw).expanduser()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Could not create that folder: {exc}") from exc
+    return {"path": str(target.resolve())}
+
+
+VOICE_SUMMARY_PROMPT = (
+    "You convert the assistant's written reply into a SHORT spoken response that will be read aloud "
+    "by a text-to-speech voice. Speak directly to the user in the first person, as the assistant.\n"
+    "Rules:\n"
+    "- Be as concise as possible while keeping every important point — never lose key details.\n"
+    "- If the reply confirms a completed action (email sent, file created, task done), say so in one "
+    "short sentence and include the key detail (who / what / where).\n"
+    "- If the reply asks the user a question or needs a decision, lead with that question.\n"
+    "- Otherwise give the main points or the answer the user asked for, in 1-3 short sentences.\n"
+    "- Plain spoken words only: no markdown, no bullet lists, no code, no URLs, no emoji.\n"
+    "- Reply in the same language as the user's message.\n"
+    "- Do not add filler like 'the details are in the chat' unless you genuinely had to leave a lot out.\n"
+    "Output only the spoken text, nothing else."
+)
+
+
+class VoiceSummaryPayload(BaseModel):
+    reply: str
+    question: str = ""
+    lang: str = ""
+
+
+@app.post("/api/voice/summarize")
+async def voice_summarize(payload: VoiceSummaryPayload) -> Dict[str, str]:
+    reply = (payload.reply or "").strip()
+    if not reply:
+        return {"summary": ""}
+    settings = db.get_settings()
+    model = resolve_model_name(settings.get("default_model"), await list_models())
+    if not model:
+        return {"summary": ""}  # frontend falls back to its on-device heuristic
+    question = (payload.question or "").strip()
+    user_content = (f"User asked:\n{question}\n\n" if question else "") + (
+        f"Assistant's full written reply:\n{reply}\n\nSpoken version:"
+    )
+    options = {"num_ctx": 8192, "num_predict": 220, "temperature": 0.2, "think": False}
+    summary = ""
+    try:
+        async for chunk in chat_stream(
+            model,
+            [
+                {"role": "system", "content": VOICE_SUMMARY_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            [],
+            dict(options),
+        ):
+            if chunk.get("error"):
+                raise RuntimeError(str(chunk["error"]))
+            summary += str((chunk.get("message") or {}).get("content") or "")
+    except Exception:
+        return {"summary": ""}  # frontend falls back to its on-device heuristic
+    return {"summary": summary.strip()}
+
+
 @app.get("/api/memories")
 async def list_memories(
     scope: Optional[str] = None,
@@ -1127,8 +1220,9 @@ async def create_memory(payload: MemoryPayload) -> Dict[str, Any]:
 
 @app.patch("/api/memories/{memory_id}")
 async def patch_memory(memory_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    source = "Archived in settings" if payload.get("status") == "archived" else "Edited in settings"
     try:
-        entry = db.update_memory(memory_id, payload)
+        entry = db.update_memory(memory_id, payload, source=source)
     except KeyError:
         raise HTTPException(status_code=404, detail="Memory not found")
     except ValueError as exc:
@@ -1140,7 +1234,7 @@ async def patch_memory(memory_id: str, payload: Dict[str, Any]) -> Dict[str, Any
 @app.post("/api/memories/{memory_id}/approve")
 async def approve_memory(memory_id: str) -> Dict[str, Any]:
     try:
-        entry = db.update_memory(memory_id, {"status": "active"})
+        entry = db.update_memory(memory_id, {"status": "active"}, source="Approved in settings")
     except KeyError:
         raise HTTPException(status_code=404, detail="Memory not found")
     memory.sync_memory_files()
@@ -1150,7 +1244,7 @@ async def approve_memory(memory_id: str) -> Dict[str, Any]:
 @app.delete("/api/memories/{memory_id}")
 async def remove_memory(memory_id: str) -> Dict[str, Any]:
     try:
-        db.delete_memory(memory_id)
+        db.delete_memory(memory_id, source="Deleted in settings")
     except KeyError:
         raise HTTPException(status_code=404, detail="Memory not found")
     memory.sync_memory_files()
@@ -1160,6 +1254,39 @@ async def remove_memory(memory_id: str) -> Dict[str, Any]:
 @app.post("/api/memories/consolidate")
 async def consolidate_memories() -> Dict[str, int]:
     return memory.consolidate()
+
+
+@app.get("/api/memory/files")
+async def memory_files() -> Dict[str, Any]:
+    """All memory files (soul, user, one per agent) with entry counts and last-change time."""
+    agents = db.list_agents()
+    aggregates = {(row["scope"], row["agent_id"]): row for row in db.memory_file_aggregates()}
+
+    def describe(scope: str, agent_id: str, label: str, agent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        agg = aggregates.get((scope, agent_id)) or {}
+        return {
+            "scope": scope,
+            "agent_id": agent_id,
+            "label": label,
+            "file_name": memory.memory_file_name(scope, agent),
+            "active_count": agg.get("active_count", 0),
+            "total_count": agg.get("total_count", 0),
+            "change_count": agg.get("change_count", 0),
+            "last_changed_at": agg.get("last_changed_at"),
+        }
+
+    files = [describe("soul", "", "Soul"), describe("user", "", "User")]
+    files.extend(describe("agent", str(agent.get("id") or "default"), agent.get("name") or "Agent", agent) for agent in agents)
+    return {"files": files}
+
+
+@app.get("/api/memory/changes")
+async def memory_changes(
+    scope: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    return {"changes": db.list_memory_changes(scope=scope, agent_id=agent_id, limit=limit)}
 
 
 @app.get("/api/agents")
@@ -1660,6 +1787,12 @@ async def stream_chat(payload: ChatPayload) -> StreamingResponse:
             ).strip()
         if plugin_tool_definitions:
             system_prompt = f"{system_prompt}\n\n{AGENTIC_TOOL_DIRECTIVE}".strip()
+            _out_dir = str(settings.get("files_output_dir") or "").strip()
+            if _out_dir:
+                system_prompt = (
+                    f"{system_prompt}\n\nWhen you create a file or document and the user hasn't named a "
+                    f"folder, save it in: {_out_dir}"
+                ).strip()
         plugin_injections = reg.plugin_injections(enabled_tools)
         if plugin_injections:
             system_prompt = f"{system_prompt}\n\n{plugin_injections}".strip()
@@ -2074,6 +2207,12 @@ async def run_background_chat_job(
             ).strip()
         if plugin_tool_definitions:
             system_prompt = f"{system_prompt}\n\n{AGENTIC_TOOL_DIRECTIVE}".strip()
+            _out_dir = str(settings.get("files_output_dir") or "").strip()
+            if _out_dir:
+                system_prompt = (
+                    f"{system_prompt}\n\nWhen you create a file or document and the user hasn't named a "
+                    f"folder, save it in: {_out_dir}"
+                ).strip()
         plugin_injections = reg.plugin_injections(enabled_tools)
         if plugin_injections:
             system_prompt = f"{system_prompt}\n\n{plugin_injections}".strip()
@@ -2421,6 +2560,7 @@ async def run_background_chat_job(
                 user_message["content"] if user_message else payload.message,
                 answer,
             )
+            memory.maybe_schedule_reconciliation(job.model, agent, job.conversation_id)
             return
 
     except asyncio.CancelledError:
